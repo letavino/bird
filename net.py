@@ -1,111 +1,151 @@
 import os
-import csv
+import json
+import time
+import math
+import random
 import numpy as np
-import pandas as pd
-from PIL import Image
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from keras import optimizers
-from keras.preprocessing.image import ImageDataGenerator
-from keras.models import Sequential
-from keras.layers import Dense, Dropout
-from keras.layers.core import Dense, Activation
-from sklearn.preprocessing import OneHotEncoder
-from keras.layers import Dense, Flatten
-from keras.layers import Conv2D, MaxPooling2D
 
-from keras.utils import plot_model
-from scipy.misc import imread
-from keras.preprocessing.image import ImageDataGenerator
-from keras import utils as np_utils
+from keras import callbacks
+from keras.models import Model
+from keras.layers import Input, Dense, BatchNormalization, PReLU
+from keras.applications.inception_resnet_v2 import InceptionResNetV2
 
+from callbacks import StopTraining
+from angle import normAngle
+from generator import dataGeneratorTraining
+from plotter import plotLoss
+from galApproach import GalDropout
+from TrackingNetwork import ModelLoader, loadBackgroundImg
+
+######################################################
+##### Skript zum Erstellen und Trainieren eines Netzes
+#####
+######################################################
+
+### Initialisierung
 batch_size = 32
-epochs = 500
-img_size = (32,32)
-input_shape = (img_size[0],img_size[1],3)
-output = 2
+n_workers = 16
 
-print('\nload data')
+epochs = 12500000
+output = 6
 
-with open("dataset_train.csv", "r") as f:
-	train = list(np.array(list(csv.reader(f))).T)
+imgFolder = "images\\dragon\\"
+imgData = "data\\dragon.json"
 
-with open("dataset_test.csv", "r") as f:
-	test = np.array(list(csv.reader(f))).T
-
-folder = 'mixed/'
-
-xTrain = np.array([imread(folder+fname) for fname in train[0]]) / 255
-yTrain = train[1]
-xTest = np.array([imread(folder+fname) for fname in test[0]]) / 255
-yTest = test[1]
+modelFolder = "models\\"
+logFolder = "log\\"
+bkgFolder = "background\\"
 
 
-integer_encoded = yTrain
-onehot_encoder = OneHotEncoder(sparse=False)
-integer_encoded = integer_encoded.reshape(len(integer_encoded), 1)
-yTrain = onehot_encoder.fit_transform(integer_encoded)
+### Programm
 
-integer_encoded = yTest
-onehot_encoder = OneHotEncoder(sparse=False)
-integer_encoded = integer_encoded.reshape(len(integer_encoded), 1)
-yTest = onehot_encoder.fit_transform(integer_encoded)
+# Liest Bildgröße und Normierung aus JSON
+# Parameter
+#	imgData: 	JSON Datei
+# Return
+#	Bildgröße (w,h) in Pixel, Liste der Normierungen der y-Werte
 
-datagen = ImageDataGenerator(
-	rotation_range=15,
-    width_shift_range=0.15,
-    height_shift_range=0.15,
-    shear_range=0.15,
-    zoom_range=0.2,
-    channel_shift_range=0.15,
-    vertical_flip=True,
-    rescale=None,
-	preprocessing_function=None)
+def readConfig(imgData):
+	with open(imgData) as f:
+		js = json.load(f)
+		img_size = js['resolution']
+		norm = js['norm']
+	return img_size, norm
 
-datagen.fit(xTrain)
 
-print("\nBuild model")
+# Erstellt einen Datensatz 
+# Parameter
+#	imgFolder: 	Pfad der Bilder
+#	imgData: 	JSON Datei, Ground Thruth
+#	usage:		Berücksichtigt nur Einträge mit Attribut usage="usage", bei none werden alle geladen
+# Return
+#	Liste der Dateinamen der Bilder, Liste des Ground Truth	
+	
+def createDataset(imgFolder, imgData, usage=None):
+	with open(imgData) as f:
+		js = json.load(f)
+		
+		norm = js['norm']
 
-model = Sequential()
-model.add(Conv2D(128, kernel_size=(5, 5),activation='relu', input_shape=input_shape))
-model.add(MaxPooling2D(pool_size=(2, 2)))
-model.add(Conv2D(128, kernel_size=(5, 5),activation='relu'))
-model.add(Flatten())
-model.add(Dense(5000, activation='relu'))
-model.add(Dropout(0.75))
-model.add(Dense(1000, activation='relu'))
-model.add(Dropout(0.75))
-model.add(Dense(100, activation='relu'))
-model.add(Dense(10, activation='relu'))
-model.add(Dense(output, activation='softmax'))
+		x = []
+		y = []
 
-print("\nStart training")
+		for pos in js['position']: 
+			
+			entry = [
+				pos['x']/norm[0],
+				pos['y']/norm[1],
+				pos['z']/norm[2],
+				normAngle(pos['relpitch'])/norm[3],
+				normAngle(pos['relyaw'])/norm[4],
+				normAngle(pos['roll'])/norm[5]
+			]
+			if usage==None or usage==pos['usage']:
+				x.append(pos['name'])
+				y.append(entry)
+	
+	return x, y
 
-sgd = optimizers.SGD(lr=0.01, decay=1e-5, momentum=0.9, nesterov=True)
-model.compile(optimizer=sgd, loss='mse', metrics=['accuracy'])
+img_size, norm = readConfig(imgData)	
+input_shape = (img_size[0],img_size[1],3,)
+xTrainFiles, yTrainAll = createDataset(imgFolder, imgData, usage='train')
+xValidFiles, yValidAll = createDataset(imgFolder, imgData, usage='valid')
 
-history = model.fit_generator(datagen.flow(xTrain, yTrain, batch_size=batch_size), steps_per_epoch=len(xTrain) / 32, epochs=epochs, verbose=1,validation_data=(xTest,yTest))
+print("Build model")
+input = Input(shape=input_shape)
 
-score = model.evaluate(xTest, yTest, batch_size=batch_size)
+baseModel = InceptionResNetV2(include_top=False, weights=None, input_tensor=input, input_shape=input_shape, pooling='max', classes=1000)
+baseModel.load_weights('inception_resnet_v2_weights_tf_dim_ordering_tf_kernels_notop.h5')
 
+x = GalDropout(0.25)(baseModel.output)
+x = Dense(1000, activation='linear', kernel_initializer='he_normal')(x)
+x = BatchNormalization()(x)
+x = PReLU()(x)
+x = Dense(1000, activation='linear', kernel_initializer='he_normal')(x)
+x = BatchNormalization()(x)
+x = PReLU()(x)
+x = Dense(100, activation='linear', kernel_initializer='he_normal')(x)
+x = BatchNormalization()(x)
+x = PReLU()(x)
+x = Dense(10, activation='linear', kernel_initializer='he_normal')(x)
+x = BatchNormalization()(x)
+x = PReLU()(x)
+x = Dense(output, activation='linear', kernel_initializer='he_normal')(x)
+
+model = Model(inputs = input, outputs = x)
+
+loader = ModelLoader(path="", batch_size=32, norm=norm, r=norm[0]/3, size=img_size)
+model.compile(optimizer='Adadelta', loss=loader.proj3d, metrics=[loader.sixDof, loader.sixDofMet])
+	
+model.summary()
+
+print("Load background images")
+bkg1 = loadBackgroundImg(bkgFolder=bkgFolder, num=8000, end=8000)	
+bkg2 = loadBackgroundImg(bkgFolder=bkgFolder, num=442, start=8000)	
+
+print("Create generator")	
+generatorTrain = dataGeneratorTraining(xTrainFiles, yTrainAll, batch_size, bkg1, imgFolder)
+generatorValid = dataGeneratorTraining(xValidFiles, yValidAll, batch_size, bkg2, imgFolder)
+
+print("Create callbacks")
+stopCallback = StopTraining()
+checkpoint = callbacks.ModelCheckpoint(modelFolder+"weights.{epoch:02d}-{val_loss:.2f}.hdf5", monitor='val_loss', verbose=0, save_best_only=False, period=10)
+tbCallback = callbacks.TensorBoard(log_dir=logFolder+str(random.random()), histogram_freq=0, write_graph=True)
+
+### START TRAINING
+print("Start training")
+history = model.fit_generator(
+	generator=generatorTrain,
+	steps_per_epoch=len(yTrainAll)/batch_size/1000, 	
+	epochs=epochs, 
+	verbose=1,
+	validation_data=generatorValid,
+	validation_steps=len(yValidAll)/batch_size/1000,
+	callbacks=[tbCallback,stopCallback,checkpoint],
+	workers = n_workers)
+				
 print("\nTraining done")
 model.save('model.h5')
 print("\nModel saved")
 
-# summarize history for accuracy
-plt.plot(history.history['acc'])
-plt.plot(history.history['val_acc'])
-plt.title('model accuracy')
-plt.ylabel('accuracy')
-plt.xlabel('epoch')
-plt.legend(['train', 'test'], loc='upper left')
-plt.show()
-
-# summarize history for loss
-plt.plot(history.history['loss'])
-plt.plot(history.history['val_loss'])
-plt.title('model loss')
-plt.ylabel('loss')
-plt.xlabel('epoch')
-plt.legend(['train', 'test'], loc='upper left')
-plt.show()
+plotLoss(history.history)
